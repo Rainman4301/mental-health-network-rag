@@ -1,0 +1,24 @@
+# Secrets — never commit
+.env
+
+# Airflow runtime artefacts
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Data files (large; use Azure Blob instead)
+data/
+*.parquet
+*.csv
+*.npy
+*.pkl
+*.faiss
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# Mental Health ETL — Airflow + PostgreSQL
+# ---------------------------------------------------------------------------
+# Start:   docker compose up -d
+# UI:      http://localhost:8080  (airflow / airflow)
+# Stop:    docker compose down
+# Logs:    docker compose logs -f airflow
+# ---------------------------------------------------------------------------
+
+services:
+
+  # ── PostgreSQL (Airflow metadata DB) ──────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: mh_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Airflow (LocalExecutor — no Redis / Celery needed) ────────────────────
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mh_airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment:
+      # Core
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY}"
+      # DB
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # Webserver
+      AIRFLOW__WEBSERVER__SECRET_KEY: "${AIRFLOW_WEBSERVER_SECRET_KEY}"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    volumes:
+      - ./dags:/opt/airflow/dags           # DAG files
+      - ./scripts:/opt/airflow/scripts     # ETL scripts (mounted, not baked in)
+      - ./logs:/opt/airflow/logs
+      - ./config:/opt/airflow/config
+      - ./plugins:/opt/airflow/plugins
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create
+          --username airflow --password airflow
+          --firstname Air --lastname Flow
+          --role Admin --email admin@local.dev 2>/dev/null || true &&
+        airflow scheduler &
+        airflow webserver
+      "
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  postgres_db:
