@@ -19,6 +19,8 @@ import calendar
 import json
 import os
 import re
+import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -39,8 +41,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium_stealth import stealth
 from tqdm import tqdm
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType
 
 # ---------------------------------------------------------------------------
 # Config (read from environment variables set in .env / docker-compose)
@@ -70,7 +70,7 @@ TAG_URLS: dict[str, str] = {
 
 SCRAPE_PAGES: int = int(os.getenv("SCRAPE_PAGES", "2"))
 CUTOFF_DATE: str = "2015-01-01"
-MAX_WORKERS: int = 3               # parallel threads for comment scraping
+MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "3"))   # parallel threads for comment scraping
 
 # Kaomoji mapping file — mounted alongside scripts
 KAOMOJI_PATH = Path(__file__).parent / "kaomoji_to_text.json"
@@ -88,10 +88,20 @@ def _load_kaomoji() -> dict[str, str]:
 KAOMOJI: dict[str, str] = _load_kaomoji()
 _WEEKDAYS = [d.lower() for d in list(calendar.day_name)]
 
-# Resolve the ChromeDriver binary once at import time (cached under ~/.wdm).
-# _make_driver() is called once per post (see _scrape_comments), so resolving
-# the path here avoids a network/version check on every single instantiation.
-_CHROMEDRIVER_PATH: str = ChromeDriverManager(chrome_type=ChromeType.GOOGLE).install()
+# ---------------------------------------------------------------------------
+# ChromeDriver resolution
+# ---------------------------------------------------------------------------
+# In Docker, this is baked into the image at build time (see Dockerfile) —
+# no network lookup needed at runtime. For local (non-Docker) testing, falls
+# back to whatever `chromedriver` is on PATH.
+_CHROMEDRIVER_PATH: str | None = os.getenv("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+if not _CHROMEDRIVER_PATH:
+    raise RuntimeError(
+        "Could not locate chromedriver. In Docker this should come from the "
+        "CHROMEDRIVER_PATH env var baked in at build time — rebuild the image. "
+        "For local testing, install chromedriver and ensure it's on PATH, or "
+        "set CHROMEDRIVER_PATH yourself."
+    )
 
 
 def _make_driver() -> webdriver.Chrome:
@@ -101,13 +111,18 @@ def _make_driver() -> webdriver.Chrome:
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-images")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
     )
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    # "--disable-images" is not a real Chrome flag and was silently ignored —
+    # this is the actual way to skip image loading (saves bandwidth/time
+    # since we only ever scrape text).
+    options.add_experimental_option(
+        "prefs", {"profile.managed_default_content_settings.images": 2}
+    )
 
     driver = webdriver.Chrome(service=Service(_CHROMEDRIVER_PATH), options=options)
     driver.set_page_load_timeout(45)
@@ -122,6 +137,41 @@ def _make_driver() -> webdriver.Chrome:
         fix_hairline=True,
     )
     return driver
+
+
+# ---------------------------------------------------------------------------
+# Driver pool for comment scraping
+# ---------------------------------------------------------------------------
+# The original version launched a brand-new headless Chrome process for
+# EVERY post's comment thread, even under ThreadPoolExecutor — with a couple
+# hundred posts per run that's a couple hundred Chrome launches (~150-300MB
+# and a few seconds each). Since ThreadPoolExecutor reuses the same N worker
+# threads for the life of the pool, we instead give each worker thread ONE
+# persistent driver via thread-local storage, reused across every post that
+# thread handles. This drops total Chrome launches from "one per post" to
+# "one per worker thread" (MAX_WORKERS total).
+_thread_local = threading.local()
+_pooled_drivers: list[webdriver.Chrome] = []
+_pool_lock = threading.Lock()
+
+
+def _get_pooled_driver() -> webdriver.Chrome:
+    if not hasattr(_thread_local, "driver"):
+        driver = _make_driver()
+        _thread_local.driver = driver
+        with _pool_lock:
+            _pooled_drivers.append(driver)
+    return _thread_local.driver
+
+
+def _quit_pooled_drivers() -> None:
+    with _pool_lock:
+        for driver in _pooled_drivers:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        _pooled_drivers.clear()
 
 
 def _parse_post_date(raw: str) -> str | None:
@@ -172,38 +222,35 @@ def _convert_emojis(text: str) -> str:
 
 def _scrape_comments(url: str, wait: int = 20) -> str:
     """Return all comments for a single post joined by ' ||| '."""
-    driver = _make_driver()
+    driver = _get_pooled_driver()
     comments: list[str] = []
-    try:
-        for attempt in range(2):
-            try:
-                driver.get(url)
-                WebDriverWait(driver, wait).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "linear-message-list"))
-                )
-                break
-            except TimeoutException:
-                if attempt == 1:
-                    return ""
+    for attempt in range(2):
+        try:
+            driver.get(url)
+            WebDriverWait(driver, wait).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "linear-message-list"))
+            )
+            break
+        except TimeoutException:
+            if attempt == 1:
+                return ""
 
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        section = soup.find("div", class_="lia-component-message-list-detail-with-inline-editors")
-        if not section:
-            return ""
-        msg_list = section.find("div", class_="linear-message-list message-list")
-        if not msg_list:
-            return ""
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    section = soup.find("div", class_="lia-component-message-list-detail-with-inline-editors")
+    if not section:
+        return ""
+    msg_list = section.find("div", class_="linear-message-list message-list")
+    if not msg_list:
+        return ""
 
-        for comment_div in msg_list.find_all("div", recursive=False):
-            main = comment_div.find("div", class_="lia-quilt-row lia-quilt-row-message-main")
-            if not main:
-                continue
-            try:
-                comments.append(_convert_emojis(main.get_text(separator=" ", strip=True)))
-            except Exception as exc:
-                print(f"[Warning] Comment parse error: {exc}")
-    finally:
-        driver.quit()
+    for comment_div in msg_list.find_all("div", recursive=False):
+        main = comment_div.find("div", class_="lia-quilt-row lia-quilt-row-message-main")
+        if not main:
+            continue
+        try:
+            comments.append(_convert_emojis(main.get_text(separator=" ", strip=True)))
+        except Exception as exc:
+            print(f"[Warning] Comment parse error: {exc}")
 
     return " ||| ".join(comments)
 
@@ -214,99 +261,103 @@ def _scrape_tag(tag: str, base_url: str, pages: int, existing_ids: set[str]) -> 
     url = base_url
     posts: list[dict] = []
 
+    # One pool for the whole tag (not recreated per page) so the MAX_WORKERS
+    # worker threads — and the pooled Chrome driver each one builds on first
+    # use — get reused across every page of this tag, not just one page.
     try:
-        for page in tqdm(range(1, pages + 1), desc=f"[{tag}] pages"):
-            for attempt in range(2):
-                try:
-                    driver.get(url)
-                    WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CLASS_NAME, "custom-message-list"))
-                    )
-                    break
-                except TimeoutException:
-                    if attempt == 1:
-                        print(f"[Warning] Timeout on page {page}, skipping.")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for page in tqdm(range(1, pages + 1), desc=f"[{tag}] pages"):
+                for attempt in range(2):
+                    try:
+                        driver.get(url)
+                        WebDriverWait(driver, 8).until(
+                            EC.presence_of_element_located((By.CLASS_NAME, "custom-message-list"))
+                        )
                         break
+                    except TimeoutException:
+                        if attempt == 1:
+                            print(f"[Warning] Timeout on page {page}, skipping.")
+                            break
 
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            block = soup.find("div", class_="custom-message-list all-discussions")
-            if not block:
-                print(f"[Warning] No discussion list on page {page}.")
-                break
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+                block = soup.find("div", class_="custom-message-list all-discussions")
+                if not block:
+                    print(f"[Warning] No discussion list on page {page}.")
+                    break
 
-            post_links: list[tuple] = []
-            for article in block.find_all("article"):
-                try:
-                    href = article.find("h3").find_all("a")[1]["href"]
-                    post_id = href.split("/")[-1]
-                    if post_id in existing_ids:
-                        continue
-                    full_url = f"https://forums.beyondblue.org.au{href}"
-                    post_links.append((article, full_url, post_id))
-                except Exception as exc:
-                    print(f"[Error] Article parse: {exc}")
+                post_links: list[tuple] = []
+                for article in block.find_all("article"):
+                    try:
+                        href = article.find("h3").find_all("a")[1]["href"]
+                        post_id = href.split("/")[-1]
+                        if post_id in existing_ids:
+                            continue
+                        full_url = f"https://forums.beyondblue.org.au{href}"
+                        post_links.append((article, full_url, post_id))
+                    except Exception as exc:
+                        print(f"[Error] Article parse: {exc}")
 
-            # Parallel comment scraping (bounded thread pool)
-            def _scrape_one(args):
-                article, full_url, post_id = args
-                try:
-                    cat_aside = article.find("aside")
-                    cat_info = (
-                        cat_aside.find("div", class_="custom-tile-category-content")
-                        if cat_aside else None
-                    )
-                    raw_date = (
-                        cat_info.find("time").text.strip()
-                        if cat_info and cat_info.find("time") else ""
-                    )
-                    post_date = _parse_post_date(raw_date)
-                    if post_date and pd.to_datetime(post_date) < pd.to_datetime(CUTOFF_DATE):
+                # Parallel comment scraping (bounded thread pool, drivers pooled per worker)
+                def _scrape_one(args):
+                    article, full_url, post_id = args
+                    try:
+                        cat_aside = article.find("aside")
+                        cat_info = (
+                            cat_aside.find("div", class_="custom-tile-category-content")
+                            if cat_aside else None
+                        )
+                        raw_date = (
+                            cat_info.find("time").text.strip()
+                            if cat_info and cat_info.find("time") else ""
+                        )
+                        post_date = _parse_post_date(raw_date)
+                        if post_date and pd.to_datetime(post_date) < pd.to_datetime(CUTOFF_DATE):
+                            return None
+
+                        title_tag = article.find("h3").find_all("a")[1]
+                        content_tag = article.find("p", class_="body-text")
+                        author_info = (
+                            article.find("aside")
+                            .find("div", class_="custom-tile-author-info")
+                            if article.find("aside") else None
+                        )
+                        reply_info = article.find("li", class_="custom-tile-replies")
+
+                        return {
+                            "Post ID": post_id,
+                            "Post Title": _convert_emojis(title_tag.text.strip()) if title_tag else "",
+                            "Post Content": _convert_emojis(content_tag.text.strip()) if content_tag else "",
+                            "Post Author": (
+                                author_info.find("a").find("span").text.strip()
+                                if author_info and author_info.find("a") else ""
+                            ),
+                            "Post Date": post_date,
+                            "Post Category": tag,
+                            "Number of Comments": (
+                                reply_info.find("b").text.strip()
+                                if reply_info and reply_info.find("b") else "0"
+                            ),
+                            "Comments": _scrape_comments(full_url),
+                        }
+                    except Exception as exc:
+                        print(f"[Error] Post {post_id}: {exc}")
                         return None
 
-                    title_tag = article.find("h3").find_all("a")[1]
-                    content_tag = article.find("p", class_="body-text")
-                    author_info = (
-                        article.find("aside")
-                        .find("div", class_="custom-tile-author-info")
-                        if article.find("aside") else None
-                    )
-                    reply_info = article.find("li", class_="custom-tile-replies")
-
-                    return {
-                        "Post ID": post_id,
-                        "Post Title": _convert_emojis(title_tag.text.strip()) if title_tag else "",
-                        "Post Content": _convert_emojis(content_tag.text.strip()) if content_tag else "",
-                        "Post Author": (
-                            author_info.find("a").find("span").text.strip()
-                            if author_info and author_info.find("a") else ""
-                        ),
-                        "Post Date": post_date,
-                        "Post Category": tag,
-                        "Number of Comments": (
-                            reply_info.find("b").text.strip()
-                            if reply_info and reply_info.find("b") else "0"
-                        ),
-                        "Comments": _scrape_comments(full_url),
-                    }
-                except Exception as exc:
-                    print(f"[Error] Post {post_id}: {exc}")
-                    return None
-
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
                 futures = {pool.submit(_scrape_one, args): args for args in post_links}
                 for future in as_completed(futures):
                     result = future.result()
                     if result:
                         posts.append(result)
 
-            next_page = soup.find("a", rel="next")
-            if next_page and next_page.get("href", "").startswith("http"):
-                url = next_page["href"]
-                time.sleep(1)
-            else:
-                break
+                next_page = soup.find("a", rel="next")
+                if next_page and next_page.get("href", "").startswith("http"):
+                    url = next_page["href"]
+                    time.sleep(1)
+                else:
+                    break
     finally:
         driver.quit()
+        _quit_pooled_drivers()
 
     return posts
 

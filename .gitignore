@@ -11,3 +11,4 @@ LLM_NetworkMoel_MentalHealth/extracted_text.txt
 *.faiss
 *.pkl
 *.parquet
+*.npy

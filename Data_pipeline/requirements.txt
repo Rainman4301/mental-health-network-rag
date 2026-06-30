@@ -3,9 +3,11 @@
 # ---------------------------------------------------------------------------
 
 # Scraping
+# NOTE: chromedriver is no longer resolved at runtime via webdriver-manager —
+# it's baked into the Docker image at build time (see Dockerfile). This keeps
+# DAG runs from depending on network access to Google's CDN every execution.
 selenium==4.21.0
 selenium-stealth==1.0.6
-webdriver-manager==4.0.1
 beautifulsoup4==4.12.3
 
 # Text / NLP
@@ -16,6 +18,7 @@ spacy==3.7.5
 
 # Data
 pandas==2.2.2
+numpy==1.26.4
 pyarrow==16.1.0          # Parquet read/write
 
 # Embeddings + vector index (script 2)
