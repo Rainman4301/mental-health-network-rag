@@ -23,7 +23,15 @@ pyarrow==16.1.0          # Parquet read/write
 
 # Embeddings + vector index (script 2)
 sentence-transformers==3.0.1
-faiss-cpu==1.8.0          # swap for faiss-gpu if running on GPU
+faiss-cpu==1.14.3         # swap for faiss-gpu if running on GPU
+
+# LangChain — only used to build/save the FAISS index in the exact format
+# expected by langchain_community.vectorstores.FAISS.load_local() in the
+# RAG chatbot repo. NOTE: langchain-community is in maintenance/sunset mode
+# upstream (see https://github.com/langchain-ai/langchain-community/issues/674)
+# but is still the current documented path for the FAISS integration.
+langchain-core==1.4.8
+langchain-community==0.4.2
 
 # Azure Blob Storage
 azure-storage-blob==12.20.0

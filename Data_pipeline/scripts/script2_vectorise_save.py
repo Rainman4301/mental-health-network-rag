@@ -11,17 +11,25 @@ Responsibilities:
      cleaning (emoji/kaomoji conversion, lowercasing) already happened in
      script1, and transformer embeddings work best on close-to-natural text.
   4. Encode post text with SentenceTransformer.
-  5. Save TWO output formats, sharing one canonical metadata file so nothing
-     is duplicated across them:
-       - npy/embeddings.npy        → raw embedding matrix, for BERTopic or
-                                      whatever else you want downstream
-       - npy/metadata.parquet      → post_id, tag, model_text, post_date —
-                                      row order matches embeddings.npy 1:1
-       - faiss/index.faiss         → IndexFlatIP built from the same
-                                      embeddings, for RAG-style similarity
-                                      search (use row index to look up
-                                      npy/metadata.parquet for the matching
-                                      record)
+  5. Save everything downstream consumers need, in numpy-native / FAISS
+     formats only — no parquet, no ad-hoc pickle:
+       - npy/embeddings.npy   → raw embedding matrix, for BERTopic or
+                                 whatever else you want downstream
+       - npy/metadata.npz     → post_id, tag, model_text, post_date as
+                                 parallel numpy arrays (one per key) — row
+                                 order matches embeddings.npy 1:1
+       - faiss/index.faiss    → FAISS index, built via LangChain's FAISS
+       - faiss/index.pkl      → vectorstore wrapper (LangChain's docstore +
+                                 index_to_docstore_id mapping — this is what
+                                 makes it loadable directly with
+                                 langchain_community.vectorstores.FAISS
+                                 .load_local() for the RAG chatbot, instead
+                                 of hand-rolling a raw faiss.IndexFlatIP)
+
+     The corpus is embedded once with SentenceTransformer (batched, GPU-
+     friendly) and handed to LangChain pre-computed — LangChain never
+     re-embeds the documents, it only needs an Embeddings object so it can
+     embed *future* queries at search time.
 
 Airflow calls run() — also runnable directly for testing:
     python script2_vectorise_save.py
@@ -35,11 +43,22 @@ import tempfile
 from datetime import datetime
 from io import BytesIO
 
-import faiss
 import numpy as np
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
 from sentence_transformers import SentenceTransformer
+
+# LangChain's FAISS vectorstore — this is the piece that makes the saved
+# index.faiss/index.pkl pair loadable directly with
+# `langchain_community.vectorstores.FAISS.load_local(...)` in the RAG
+# chatbot notebook, instead of a hand-rolled faiss.IndexFlatIP that the RAG
+# side would have to reverse-engineer LangChain's docstore format for.
+# Note (2026): langchain-community is in maintenance/sunset mode upstream
+# but is still the documented install for the FAISS integration — no
+# successor package exists yet, so this is the correct current choice.
+from langchain_community.vectorstores import FAISS as LangChainFAISS
+from langchain_community.vectorstores.utils import DistanceStrategy
+from langchain_core.embeddings import Embeddings as LCEmbeddings
 
 # ---------------------------------------------------------------------------
 # Config
@@ -72,9 +91,10 @@ EMBED_BATCH: int = 64
 NORMALIZE_EMBEDDINGS: bool = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
 
 # Output blob names
-EMBEDDINGS_BLOB = "npy/embeddings.npy"
-METADATA_BLOB   = "npy/metadata.parquet"
-INDEX_BLOB      = "faiss/index.faiss"
+EMBEDDINGS_BLOB  = "npy/embeddings.npy"
+METADATA_BLOB    = "npy/metadata.npz"
+FAISS_INDEX_BLOB = "faiss/index.faiss"
+FAISS_PKL_BLOB   = "faiss/index.pkl"
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -153,15 +173,25 @@ def _clean_for_modeling(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# FAISS index builder
+# LangChain Embeddings wrapper
 # ---------------------------------------------------------------------------
+# LangChain's FAISS vectorstore needs an Embeddings object even when you
+# hand it pre-computed vectors — it's only ever called again at *query*
+# time (i.e. inside the RAG chatbot, to embed the user's question so it can
+# be compared against this index). Wrapping our already-loaded
+# SentenceTransformer directly avoids pulling in langchain-huggingface
+# (which needs sentence-transformers>=5.2.0 — a much newer pin than the one
+# this pipeline uses for corpus encoding) and avoids loading the model twice.
+class SentenceTransformerEmbeddings(LCEmbeddings):
+    def __init__(self, model: SentenceTransformer, normalize: bool) -> None:
+        self._model = model
+        self._normalize = normalize
 
-def _build_index(embeddings: np.ndarray) -> faiss.Index:
-    """Build a flat inner-product index (cosine similarity on normalised vecs)."""
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)     # cosine sim = IP after L2 normalisation
-    index.add(embeddings)
-    return index
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._model.encode(texts, normalize_embeddings=self._normalize).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._model.encode([text], normalize_embeddings=self._normalize)[0].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -209,30 +239,59 @@ def run() -> None:
     ).astype("float32")
     print(f"  Embedding shape: {embeddings.shape}")
 
-    # ── 4. Build FAISS index (shares row order with embeddings/metadata) ────
-    index = _build_index(embeddings)
-    print(f"  FAISS index built — {index.ntotal} vectors, dim={index.d}")
+    # ── 4. Build the FAISS vectorstore via LangChain, from the embeddings
+    #        we already computed above (LangChain does NOT re-embed these —
+    #        it only uses the Embeddings wrapper for future queries).
+    #        distance_strategy=MAX_INNER_PRODUCT + normalised vectors ==
+    #        cosine similarity, same as the old hand-rolled IndexFlatIP.
+    metadatas = [
+        {"post_id": pid, "tag": tag, "post_date": str(date)}
+        for pid, tag, date in zip(full_df["Post ID"], full_df["tag"], full_df["Post Date"])
+    ]
+    embedding_wrapper = SentenceTransformerEmbeddings(model, NORMALIZE_EMBEDDINGS)
+    vectorstore = LangChainFAISS.from_embeddings(
+        text_embeddings=list(zip(texts, embeddings.tolist())),
+        embedding=embedding_wrapper,
+        metadatas=metadatas,
+        distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+    )
+    print(f"  LangChain FAISS store built — {vectorstore.index.ntotal} vectors")
 
     # ── 5. Save metadata — one canonical file, no duplication across
-    #        outputs, and no pickle (the downstream notebook environment has
-    #        its own pandas/numpy versions — a pickled DataFrame is a
-    #        cross-environment compatibility risk that parquet avoids).
-    #        Row order matches embeddings.npy and the FAISS index 1:1.
-    metadata_df = full_df[["Post ID", "tag", MODEL_TEXT_COL, "Post Date"]].rename(
-        columns={"Post ID": "post_id", "Post Date": "post_date", MODEL_TEXT_COL: "text"}
-    )
+    #        outputs. Saved as .npz (numpy's native multi-array archive)
+    #        rather than pickle (cross-environment version risk — a pickled
+    #        DataFrame breaks if pandas/numpy versions differ downstream) or
+    #        parquet (an extra non-numpy dependency/format we don't need
+    #        elsewhere in this pipeline). Each column becomes its own numpy
+    #        array inside the archive, all sharing row order with
+    #        embeddings.npy and the FAISS index 1:1. (This is separate from
+    #        the metadata baked into faiss/index.pkl above — that copy is
+    #        for the RAG chatbot's LangChain Documents; this one is for
+    #        BERTopic / network-analysis notebooks that just want plain
+    #        numpy arrays with no LangChain dependency.)
+    post_ids   = full_df["Post ID"].to_numpy(dtype=str)
+    tags       = full_df["tag"].to_numpy(dtype=str)
+    texts_arr  = full_df[MODEL_TEXT_COL].to_numpy(dtype=str)
+    post_dates = full_df["Post Date"].astype(str).to_numpy(dtype=str)
 
     with tempfile.TemporaryDirectory() as tmp:
-        idx_path = f"{tmp}/index.faiss"
         npy_path = f"{tmp}/embeddings.npy"
-        meta_path = f"{tmp}/metadata.parquet"
+        meta_path = f"{tmp}/metadata.npz"
 
-        faiss.write_index(index, idx_path)
+        vectorstore.save_local(tmp, index_name="index")   # writes index.faiss + index.pkl
         np.save(npy_path, embeddings)
-        metadata_df.to_parquet(meta_path, index=False)
+        np.savez(
+            meta_path,
+            post_id=post_ids,
+            tag=tags,
+            text=texts_arr,
+            post_date=post_dates,
+        )
 
-        with open(idx_path, "rb") as f:
-            _upload_bytes(f.read(), INDEX_BLOB)
+        with open(f"{tmp}/index.faiss", "rb") as f:
+            _upload_bytes(f.read(), FAISS_INDEX_BLOB)
+        with open(f"{tmp}/index.pkl", "rb") as f:
+            _upload_bytes(f.read(), FAISS_PKL_BLOB)
         with open(npy_path, "rb") as f:
             _upload_bytes(f.read(), EMBEDDINGS_BLOB)
         with open(meta_path, "rb") as f:

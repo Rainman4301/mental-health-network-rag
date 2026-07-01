@@ -91,8 +91,10 @@ with DAG(
         **Task 2 — Vectorise & Save**
 
         Reads the latest Parquet from Azure Blob, encodes posts into
-        sentence embeddings, builds a FAISS index, and saves the index
-        + metadata pickle back to Blob under `faiss/`.
+        sentence embeddings, builds a FAISS index, and saves everything
+        back to Blob in numpy-native / FAISS formats only: embeddings as
+        `npy/embeddings.npy`, metadata as `npy/metadata.npz`, and the
+        index as `faiss/index.faiss`.
         """,
     )
 
