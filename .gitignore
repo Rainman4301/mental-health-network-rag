@@ -5,6 +5,7 @@ Data_pipeline/logs/
 
 # Large/regenerable data artifacts
 LLM_NetworkMoel_MentalHealth/data/
+LLM_NetworkMoel_MentalHealth/mh-etl-data/
 LLM_NetworkMoel_MentalHealth/rag_system/
 LLM_NetworkMoel_MentalHealth/topic_modeling_result/
 LLM_NetworkMoel_MentalHealth/extracted_text.txt
