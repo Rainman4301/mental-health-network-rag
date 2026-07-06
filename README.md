@@ -21,7 +21,9 @@ A detailed explanation of the methods and findings can be found in my published 
 
 **Liao, Y.-C. (2023). _Subtopic Analysis of Mental Health Discussions Using BERTopic and Network Methods._
 In AI Research and Development. Springer.**
-Available at: https://link.springer.com/chapter/10.1007/978-3-032-09832-0_11
+Published version (subscription required): https://doi.org/10.1007/978-3-032-09832-0_11
+
+Since the published version isn't openly accessible, a copy of the manuscript is included in this repo: [Mental_Health_Topic_Modelling_Paper.pdf](./Mental_Health_Topic_Modelling_Paper.pdf)
 
 This paper supports the project's main objectives:
 
